@@ -251,7 +251,9 @@ class Decoder(nn.Module):
 
     Modes
     -----
-    hadamard     MLP(z_i * z_j).                 The original decoder.
+    hadamard     MLP(z_i * z_j).                 NOT the original decoder.
+                 The original runs used a bare dot product with no parameters
+                 — see the note below. Kept here for comparison only.
     cosine_mlp   MLP(z_i_hat * z_j_hat) * s.     Norm channel removed, MLP kept.
     cosine_pure  sum(z_i_hat * z_j_hat) * s.     Norm channel removed, no MLP.
 
@@ -259,6 +261,11 @@ class Decoder(nn.Module):
     BCE can never become confident. A learned temperature reopens the range
     without giving the model any per-node information back. Clamped at e^4 to
     stop it saturating the logits to compensate for the constraint.
+
+    NOTE on the original architecture. The trained runs used neither of these:
+    the decoder was `(z_i * z_j).sum(-1)`, a dot product with no parameters at
+    all. gcn_random_pubmedbert.pt holds only convs.0-2 keys, which is why —
+    there was nothing else to save. `dot_scores` below reproduces it.
     """
 
     def __init__(self, dim: int = HIDDEN_DIM, mode: str = "hadamard"):
@@ -436,11 +443,16 @@ def evaluate_decoders(z: np.ndarray, eval_sets: dict = None) -> dict:
 
 
 def stored_scores_auroc(tag: str = "random_pubmedbert_seed0") -> dict:
-    """AUROC from the scores archived during training (the learned MLP).
+    """AUROC from the scores archived during training.
 
     Files look like scores_{train_neg}_{features}_seed{n}_{split}_{pos|neg}.npy
-    in data/results/. This is the only way to get the learned-decoder column
-    without retraining.
+    in data/results/.
+
+    For the authoritative figures prefer the per-epoch CSVs,
+    gcn_{train_neg}_{features}_seed{n}.csv, which also carry the loss and the
+    mean positive/negative score per evaluation set. The checkpoint on disk
+    does not match them exactly (rescoring it gives 0.845 where the CSV says
+    0.901), so the CSV is the record to quote.
     """
     out = {}
     for split in ("random", "degree_matched", "crescenddi"):
@@ -683,10 +695,11 @@ if __name__ == "__main__":
 #   MLP already attenuates this on its own (0.664 > 0.620), which is why a
 #   cosine decoder was not pursued further.
 #
-#   The learned-MLP CRESCENDDI figure (0.514) comes from the archived training
-#   scores and is sound — it matches the 0.527 reported in August. The dot and
-#   cosine cells must be recomputed with the corrected EVAL_SETS; the earlier
-#   values were measured on a non-task.
+#   The 0.901 / 0.664 / 0.514 column is the epoch-400 row of
+#   gcn_random_pubmedbert_seed0.csv — the authoritative record. The original
+#   decoder was a DOT PRODUCT, not an MLP, so that column and the `dot` column
+#   below should agree; they do not (0.845), which means the checkpoint on disk
+#   is a different epoch. Quote the CSV.
 #
 # Classical baselines, logistic regression (AUROC)
 #                              ogb   degree_matched   crescenddi
@@ -713,10 +726,19 @@ if __name__ == "__main__":
 #   DrugBank-derived edges and clinical compendia (~55% of CRESCENDDI verified
 #   non-interactions appear as positive edges in OGB-ddi).
 #
+# At epoch 1, from the same CSV: 0.863 / 0.306 / 0.308 — after ONE gradient
+# step the GCN already matches a three-parameter logistic regression on degree
+# (0.880 / 0.328 / 0.329), and both sit below chance on the controls. Two
+# independent methods landing on the same three numbers.
+#
 # Open threads for whoever picks this up
-#   1. Resolve the CRESCENDDI label polarity (check_label_polarity).
-#   2. Degree-matched negative sampling during TRAINING, not just evaluation.
-#      Expected to be the strongest single intervention.
+#   1. Degree-matched negative sampling during TRAINING, not just evaluation.
+#      Addresses the cause rather than the symptom.
+#   2. Symmetrise the edge index as a controlled experiment: it alone drops
+#      r(norm, log-degree) from 0.756 to 0.541.
 #   3. LayerNorm or fixed fan-out in the encoder, since the norm channel
 #      originates there rather than in the decoder.
-#   4. Multi-seed runs: everything above is a single seed.
+#   4. Multi-seed runs for the diagnostics: those are a single seed, while the
+#      feature ablation already has five.
+#   5. Close the reproducibility gap — a fresh run gives epoch-1 loss 46.7
+#      against the logged 5.5, so some scaling detail is unaccounted for.

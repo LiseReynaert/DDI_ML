@@ -28,13 +28,6 @@ gcn_{train_neg}_{features}.pt and with no config dict. That is why the decoder
 had to be reconstructed post-hoc months later. This version saves both plus
 the configuration; do not remove that.
 
-Where to run it
----------------
-Renku has no usable GPU — the driver is too old and torch silently falls back
-to CPU, where 400 epochs of full-batch training on 1M edges is impractical.
-Training was done on Google Colab (A100/H100), roughly 20-40 min per run.
-Everything else in this project (diagnostics, baselines, scoring) runs fine
-on Renku CPU. See ddi_toolkit.py for those.
 """
 
 from __future__ import annotations
@@ -73,8 +66,9 @@ EVAL_SETS = {
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# See the note in load_everything(). False matches the original runs.
+# See the notes in load_everything(). Both match the original runs.
 SYMMETRISE = False
+STANDARDISE = False
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +84,7 @@ class Encoder(nn.Module):
     """
 
     def __init__(self, in_dim: int, hidden: int = 256, n_layers: int = 3,
-                 dropout: float = 0.0):
+                 dropout: float = 0.3):
         super().__init__()
         dims = [in_dim] + [hidden] * n_layers
         self.convs = nn.ModuleList(
@@ -108,19 +102,36 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    """MLP over the Hadamard product. Symmetric, as an undirected edge requires.
+    """(z_i, z_j) -> one logit per pair.
 
-    Concatenating [z_i ; z_j] would NOT be symmetric and would let the model
-    learn an arbitrary column order. The elementwise product is symmetric by
-    construction.
+    mode="dot" is the DEFAULT and the one that reproduces the original runs:
+    a plain dot product, (z_i * z_j).sum(-1), with no parameters at all. This
+    is the DDI-LLM architecture. Two independent pieces of evidence:
+    gcn_random_pubmedbert.pt holds only convs.0-2 and no decoder weights (a
+    dot product has none to save), and the dot product is ~256x cheaper than
+    an MLP on 2.1M pairs — which is why this trains in minutes on CPU rather
+    than hours.
+
+    mode="mlp" adds Linear(d,d) -> ReLU -> Linear(d,1) over the same Hadamard
+    product. A more expressive but DIFFERENT model: results are not comparable
+    with anything stored. Keep it for experiments, not for reproduction.
+
+    Either way the Hadamard product keeps the decoder symmetric, which an
+    undirected edge requires. Concatenating [z_i ; z_j] would not be, and
+    would let the model learn an arbitrary column order.
     """
 
-    def __init__(self, dim: int = 256):
+    def __init__(self, dim: int = 256, mode: str = "dot"):
         super().__init__()
-        self.mlp = nn.Sequential(nn.Linear(dim, dim), nn.ReLU(), nn.Linear(dim, 1))
+        assert mode in ("dot", "mlp")
+        self.mode = mode
+        if mode == "mlp":
+            self.mlp = nn.Sequential(
+                nn.Linear(dim, dim), nn.ReLU(), nn.Linear(dim, 1))
 
     def forward(self, z, pairs):
-        return self.mlp(z[pairs[:, 0]] * z[pairs[:, 1]]).squeeze(-1)
+        h = z[pairs[:, 0]] * z[pairs[:, 1]]
+        return h.sum(-1) if self.mode == "dot" else self.mlp(h).squeeze(-1)
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +155,25 @@ def load_everything(feature_name: str):
             f"{FEATURE_FILES[feature_name]} has {x_np.shape[0]} rows, "
             f"expected {N_NODES}. This feature file does not cover every OGB "
             f"node and cannot be used as-is. See DATA.md.")
+
+    # Per-column z-score, NOT an L2 row normalisation. OFF by default, and the
+    # reason is a result rather than a preference.
+    #
+    # Centring each column removes the shared mean vector, which is exactly
+    # what makes raw PubMedBERT anisotropic (mean pairwise cosine 0.921). So
+    # standardising does essentially what ZCA whitening does: cosines collapse,
+    # the angular channel fills up, and the model stops leaning on degree.
+    # Measured on degree-matched pairs: raw 0.724, standardised 0.894, and the
+    # separately-whitened pmbwhite arm 0.869. The last two agree, which is the
+    # tell — standardising the raw file turns the `pubmedbert` arm into the
+    # `pmbwhite` arm.
+    #
+    # The reference run's 0.664 on degree-matched pairs is the signature of raw
+    # anisotropic features, so it did NOT standardise. Leave this False to
+    # reproduce; the whitened variants are available as their own feature files
+    # when you want the isotropic comparison.
+    if STANDARDISE:
+        x_np = (x_np - x_np.mean(0)) / (x_np.std(0) + 1e-8)
 
     x = torch.tensor(x_np, dtype=torch.float32, device=DEVICE)
 
@@ -257,7 +287,8 @@ def evaluate(encoder, decoder, x, edge_index, save_tag: str = None) -> dict:
 def run(features: str, train_neg: str, seed: int, epochs: int = 400,
         lr: float = 5e-4, hidden: int = 256, verbose: bool = True,
         max_pairs: int = None, save: bool = True,
-        pair_batch: int = None) -> dict:
+        pair_batch: int = None, decoder_mode: str = "dot",
+        dropout: float = 0.3) -> dict:
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
 
@@ -269,8 +300,8 @@ def run(features: str, train_neg: str, seed: int, epochs: int = 400,
     y = torch.cat([torch.ones(len(pos)), torch.zeros(len(neg))]).to(DEVICE)
     pairs = torch.cat([pos_t, neg_t])
 
-    encoder = Encoder(x.size(1), hidden).to(DEVICE)
-    decoder = Decoder(hidden).to(DEVICE)
+    encoder = Encoder(x.size(1), hidden, dropout=dropout).to(DEVICE)
+    decoder = Decoder(hidden, mode=decoder_mode).to(DEVICE)
     opt = torch.optim.Adam(
         list(encoder.parameters()) + list(decoder.parameters()), lr=lr)
     loss_fn = nn.BCEWithLogitsLoss(
@@ -324,8 +355,10 @@ def run(features: str, train_neg: str, seed: int, epochs: int = 400,
                     "decoder": decoder.state_dict(),
                     "config": dict(features=features, train_neg=train_neg,
                                    seed=seed, epochs=epochs, lr=lr,
-                                   hidden=hidden, pos_weight=pos_weight,
+                                   hidden=hidden, dropout=dropout,
+                                   pos_weight=pos_weight,
                                    max_pairs=max_pairs, pair_batch=pair_batch,
+                                   decoder=decoder_mode, symmetrise=SYMMETRISE,
                                    n_train_pos=len(pos), n_train_neg=len(neg))},
                    RESULTS / f"gcn_{train_neg}_{features}_seed{seed}.pt")
         json.dump(metrics, open(RESULTS / f"metrics_{tag}.json", "w"), indent=2)
@@ -343,6 +376,10 @@ def main():
     p.add_argument("--seeds", type=int, default=1, help="with --sweep")
     p.add_argument("--epochs", type=int, default=400)
     p.add_argument("--lr", type=float, default=5e-4)
+    p.add_argument("--dropout", type=float, default=0.3,
+                   help="DDI-LLM default. Not recoverable from the checkpoint "
+                        "(dropout has no parameters), so it is a best guess — "
+                        "but it must match 06_train_gcn.ipynb to compare.")
     p.add_argument("--sweep", action="store_true",
                    help="every feature type x both regimes x --seeds seeds")
     p.add_argument("--max-train-pairs", type=int, default=None,
@@ -352,17 +389,21 @@ def main():
                    help="do not write checkpoints or scores (validation runs)")
     p.add_argument("--pair-batch", type=int, default=None,
                    help="chunk the decoder pass during training. Same update, "
-                        "lower peak memory. Try 500000 on a 16GB card.")
+                        "lower peak memory. Only useful with --decoder mlp.")
+    p.add_argument("--decoder", default="dot", choices=["dot", "mlp"],
+                   help="dot (default) reproduces the original runs; mlp is a "
+                        "different, much slower model")
     args, _ = p.parse_known_args()
 
-    if DEVICE == "cpu" and not args.max_train_pairs:
-        print("WARNING: no GPU, and no --max-train-pairs. Full-batch training "
-              "on 2.1M pairs\nwill take many hours here. Either train on Colab, "
-              "or pass\n--max-train-pairs 50000 --epochs 150 --no-save to "
-              "validate the pipeline.\n")
+    if DEVICE == "cpu" and args.decoder == "mlp" and not args.max_train_pairs:
+        print("WARNING: --decoder mlp on CPU with the full supervision set is "
+              "hours of work.\nThe dot-product decoder (the default) is ~256x "
+              "cheaper and is what the\noriginal runs used. Either drop "
+              "--decoder mlp, or add --max-train-pairs.\n")
 
     common = dict(max_pairs=args.max_train_pairs, save=not args.no_save,
-                  pair_batch=args.pair_batch)
+                  pair_batch=args.pair_batch, decoder_mode=args.decoder,
+                  dropout=args.dropout)
 
     if not args.sweep:
         run(args.features, args.train_neg, args.seed, args.epochs, args.lr,
